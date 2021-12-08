@@ -1,10 +1,17 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"bufio"
+	"fmt"
+	"hash/fnv"
+	"log"
+	"net/rpc"
+	"os"
+	"io/ioutil"
+	"sort"
+	"strconv"
+	"time"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -13,6 +20,14 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -33,34 +48,144 @@ func Worker(mapf func(string, string) []KeyValue,
 
 	// Your worker implementation here.
 
+	for {
+		reply := CallForTask()
+
+		if reply.Tasktype == MAP {
+
+			data, err := ioutil.ReadFile(reply.Filename)
+			if err != nil {
+				return
+			}
+		
+			kv := mapf(reply.Filename, string(data))
+			storeKeyValuesToTempFile(kv, reply.ReduceWorkers)
+			CallForSubmit(reply)
+			
+		} else if reply.Tasktype == REDUCE {
+
+			kv := getSortedKeyValuesFromTempFile(reply.Filename)
+			runReduceAndStore(reducef, kv, outputFileName(reply.Filename))
+			os.Remove(reply.Filename)
+			CallForSubmit(reply)
+			
+		} else if reply.Tasktype == SNOOZE {
+			time.Sleep(time.Second)
+		} else{
+			break
+		}
+	}
+
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
 
 }
 
-//
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func CallExample() {
+func outputFileName(tempFileName string) string {
+	var pos int
+	fmt.Sscanf(tempFileName, intermediateFilePrefix + "%d", &pos)
+	// log.Printf("%d %s",pos, tempFileName)
+	return outputFilePrefix + strconv.Itoa(pos)
+}
+func runReduceAndStore(reducef func(string, []string) string, intermediate []KeyValue, outFile string) {
+	file, err := os.OpenFile(outFile, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0660)
+	if err  != nil {
+		return
+	}
+	defer file.Close()
+	
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
 
-	// declare an argument structure.
-	args := ExampleArgs{}
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(file, "%v %v\n", intermediate[i].Key, output)
 
-	// fill in the argument(s).
-	args.X = 99
+		i = j
+	}
+}
+func getSortedKeyValuesFromTempFile(fileName string) []KeyValue {
+	f, err := os.Open(fileName)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	list := []KeyValue{}
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		var key, value string
+		fmt.Sscanf(scanner.Text(), "%s %s", &key, &value)
+		list = append(list, KeyValue{Key: key, Value: value})
+	}
 
-	// declare a reply structure.
-	reply := ExampleReply{}
+	sort.Sort(ByKey(list))
 
-	// send the RPC request, wait for the reply.
-	call("Coordinator.Example", &args, &reply)
-
-	// reply.Y should be 100.
-	fmt.Printf("reply.Y %v\n", reply.Y)
+	return list
 }
 
+func storeKeyValuesToTempFile(kv []KeyValue, nReduce int) {
+	
+	separatedData := make([][]KeyValue, nReduce)
+	for _, item := range kv {
+		index := ihash(item.Key) % nReduce
+		separatedData[index] = append(separatedData[index], item)
+	}
+
+	for i, data := range separatedData {
+		if len(data) == 0 {
+			continue
+		}
+
+		tmpFileName := intermediateFilePrefix + strconv.Itoa(i)
+	
+		file, err := os.OpenFile(tmpFileName, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0660)
+		if err != nil {
+			continue
+		}
+		defer file.Close()
+		for _, item := range data {
+			fmt.Fprintf(file, "%s %s\n", item.Key, item.Value)
+		}
+
+	}
+}
+
+
+func CallForTask() TaskReply {
+	args := TaskArgs{os.Getpid()}
+	reply := TaskReply{}
+
+	err := call("Coordinator.DemandTask", &args, &reply)
+
+	if !err {
+		// log.Printf("Worker process: %v will exit\n", args.WorkerId)
+	}
+	return reply
+}
+
+func CallForSubmit(taskReply TaskReply) {
+	args := SubmissionArgs{
+		WorkerId: os.Getpid(),
+		Filename: taskReply.Filename,
+		Tasktype: taskReply.Tasktype,
+	}
+
+	reply := SubmissionReply{}
+
+	err := call("Coordinator.SubmitTask", &args, &reply)
+
+	if !err {
+		// log.Println("Error sending intermediate results to Coordinator")
+	}
+}
 //
 // send an RPC request to the coordinator, wait for the response.
 // usually returns true.
