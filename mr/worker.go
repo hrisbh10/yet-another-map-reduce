@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"fmt"
 	"hash/fnv"
-	"log"
 	"net/rpc"
 	"os"
 	"io/ioutil"
@@ -44,22 +43,28 @@ func Worker(mapf func(string, string) []KeyValue,
 		reply := CallForTask()
 
 		if reply.Tasktype == MAP {
-
-			data, err := ioutil.ReadFile(reply.Filename)
+			if len(reply.Files) < 1 {
+				return
+			}
+			data, err := ioutil.ReadFile(reply.Files[0])
 			if err != nil {
 				return
 			}
 		
-			kv := mapf(reply.Filename, string(data))
-			storeKeyValuesToTempFile(kv, reply.ReduceWorkers)
-			CallForSubmit(reply)
+			kv := mapf(reply.Files[0], string(data))
+			filenames := []string{reply.Files[0]}
+			files := storeKeyValuesToTempFile(kv, reply.ReduceWorkers)
+			filenames = append(filenames, files...)
+			CallForSubmit(filenames, MAP)
 			
 		} else if reply.Tasktype == REDUCE {
 
-			kv := getSortedKeyValuesFromTempFile(reply.Filename)
-			runReduceAndStore(reducef, kv, outputFileName(reply.Filename))
-			os.Remove(reply.Filename)
-			CallForSubmit(reply)
+			kv := getSortedKeyValues(reply.Files)
+			kv = collectUniqueAndRunReduce(reducef, kv)
+			filename := outputFilePrefix + strconv.Itoa(reply.ReduceWorkers)
+			StoreReduceOutput(kv, filename)
+			filenames := []string{filename}
+			CallForSubmit(filenames, REDUCE)
 
 		} else if reply.Tasktype == SNOOZE {
 			time.Sleep(200*time.Millisecond)
@@ -79,13 +84,8 @@ func outputFileName(tempFileName string) string {
 	// log.Printf("%d %s",pos, tempFileName)
 	return outputFilePrefix + strconv.Itoa(pos)
 }
-func runReduceAndStore(reducef func(string, []string) string, intermediate []KeyValue, outFile string) {
-	file, err := os.OpenFile(outFile, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0660)
-	if err  != nil {
-		return
-	}
-	defer file.Close()
-	
+func collectUniqueAndRunReduce(reducef func(string, []string) string, intermediate []KeyValue) []KeyValue {
+	res := []KeyValue{}
 	i := 0
 	for i < len(intermediate) {
 		j := i + 1
@@ -98,12 +98,30 @@ func runReduceAndStore(reducef func(string, []string) string, intermediate []Key
 		}
 		output := reducef(intermediate[i].Key, values)
 
-		// this is the correct format for each line of Reduce output.
-		fmt.Fprintf(file, "%v %v\n", intermediate[i].Key, output)
+		res = append(res, KeyValue{Key: intermediate[i].Key, Value: output})
 
 		i = j
 	}
+
+	return res
 }
+
+func StoreReduceOutput(kv []KeyValue,  outFile string) error {
+	file, err := ioutil.TempFile("./", outFile)
+	if err != nil {
+		return err
+	}
+	defer os.Rename(file.Name(), outFile)
+
+	for _, item := range kv {
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(file, "%v %v\n", item.Key, item.Value)
+	}
+
+	file.Close()
+	return nil
+}
+
 func getSortedKeyValuesFromTempFile(fileName string) []KeyValue {
 	f, err := os.Open(fileName)
 	if err != nil {
@@ -118,6 +136,15 @@ func getSortedKeyValuesFromTempFile(fileName string) []KeyValue {
 		list = append(list, KeyValue{Key: key, Value: value})
 	}
 
+	return list
+}
+
+func getSortedKeyValues(filenames []string) []KeyValue {
+	list := []KeyValue{}
+	for _, file := range filenames {
+		kva := getSortedKeyValuesFromTempFile(file)
+		list = append(list, kva...)
+	}
 	sort.Slice(list, func (i, j int) bool{
 		return list[i].Key < list[j].Key
 	})
@@ -125,22 +152,22 @@ func getSortedKeyValuesFromTempFile(fileName string) []KeyValue {
 	return list
 }
 
-func storeKeyValuesToTempFile(kv []KeyValue, nReduce int) {
+func storeKeyValuesToTempFile(kv []KeyValue, nReduce int) []string {
 	
 	separatedData := make([][]KeyValue, nReduce)
 	for _, item := range kv {
 		index := ihash(item.Key) % nReduce
 		separatedData[index] = append(separatedData[index], item)
 	}
-
+	filenames := []string{}
 	for i, data := range separatedData {
 		if len(data) == 0 {
 			continue
 		}
 
 		tmpFileName := intermediateFilePrefix + strconv.Itoa(i)
-	
-		file, err := os.OpenFile(tmpFileName, os.O_RDWR|os.O_APPEND|os.O_CREATE, 0660)
+
+		file, err := ioutil.TempFile("./",tmpFileName)
 		if err != nil {
 			continue
 		}
@@ -148,8 +175,10 @@ func storeKeyValuesToTempFile(kv []KeyValue, nReduce int) {
 		for _, item := range data {
 			fmt.Fprintf(file, "%s %s\n", item.Key, item.Value)
 		}
+		filenames = append(filenames, file.Name())
 
 	}
+	return filenames
 }
 
 
@@ -165,11 +194,11 @@ func CallForTask() TaskReply {
 	return reply
 }
 
-func CallForSubmit(taskReply TaskReply) {
+func CallForSubmit(files []string, taskType TaskType) SubmissionReply {
 	args := SubmissionArgs{
 		WorkerId: os.Getpid(),
-		Filename: taskReply.Filename,
-		Tasktype: taskReply.Tasktype,
+		Files: files,
+		Tasktype: taskType,
 	}
 
 	reply := SubmissionReply{}
@@ -178,7 +207,10 @@ func CallForSubmit(taskReply TaskReply) {
 
 	if !err {
 		// log.Println("Error sending intermediate results to Coordinator")
+		return SubmissionReply{Status: FAILED}
 	}
+
+	return reply
 }
 //
 // send an RPC request to the coordinator, wait for the response.
@@ -190,7 +222,7 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	sockname := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
-		log.Fatal("dialing:", err)
+		os.Exit(1)
 	}
 	defer c.Close()
 

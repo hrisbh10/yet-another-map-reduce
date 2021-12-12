@@ -17,6 +17,13 @@ const (
 	SNOOZE
 )
 
+type SubmissionReplyStatus int
+
+const (
+	DONE SubmissionReplyStatus = iota
+	FAILED
+)
+
 
 const intermediateFilePrefix string = "mr-int-"
 const outputFilePrefix string  = "mr-out-"
